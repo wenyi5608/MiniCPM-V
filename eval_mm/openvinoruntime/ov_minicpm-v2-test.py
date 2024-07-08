@@ -13,6 +13,7 @@ from timm.data import IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from torchvision import transforms
 import numpy as np
 from transformers import TextStreamer
+import time
 
 from transformers.generation import GenerationConfig, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -231,8 +232,10 @@ class OVMiniCPMForCausalLM(GenerationMixin):
         language_model_path,
         device,
         tokenizer,
+        tm_infer_list,
+        vision_infer_list,
     ):
-        self.vision = core.compile_model(core.read_model(vision_path), device)
+        self.vision = core.compile_model(core.read_model(vision_path), "CPU") #device)
         self.resampler = core.compile_model(core.read_model(resampler_path), device)
         self.input_embeddings = core.compile_model(core.read_model(input_embedding_path), device)
         self.model = core.read_model(language_model_path)
@@ -252,6 +255,8 @@ class OVMiniCPMForCausalLM(GenerationMixin):
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
         self.past_len = 0
         self.tokenizer = tokenizer
+        self.tm_infer_list = tm_infer_list
+        self.vision_infer_list = vision_infer_list
 
     def can_generate(self):
         """Returns True to validate the check that the model using `GenerationMixin.generate()` can indeed generate."""
@@ -288,6 +293,7 @@ class OVMiniCPMForCausalLM(GenerationMixin):
         **kwargs,
     ) -> CausalLMOutputWithPast:
         """General inference method"""
+        
         inputs = {}
         if past_key_values is not None:
             inputs = {}
@@ -300,49 +306,34 @@ class OVMiniCPMForCausalLM(GenerationMixin):
             inputs_embeds = self.input_embeddings(input_ids)[0] * self.config.scale_emb
             inputs["inputs_embeds"] = inputs_embeds  
             batch_size = input_ids.shape[0]
-            # inputs["attention_mask"] = attention_mask
+
             if "beam_idx" in self.input_names:
                 inputs["beam_idx"] = self.next_beam_idx if self.next_beam_idx is not None else np.arange(batch_size, dtype=int)
 
-            if not self.stateful:
-                first_layer_past_key_value = torch.from_numpy(past_key_values[0][0][:, :, :, 0])
-            else:
-                first_layer_past_key_value = torch.from_numpy(self.request.query_state()[0].state.data[:, :, :, 0])
-
-            # Sum all dimensions of head_dim (-2) to avoid random errors such as: https://github.com/huggingface/transformers/pull/28032#issuecomment-1863691941
-            batch_index, non_attended_tokens = torch.where(first_layer_past_key_value.float().sum(-2) == 0)
-
-            # Get the target length
             target_length = input_ids.shape[1]
-            past_length = first_layer_past_key_value.shape[-1]
-
+            past_length = self.past_len
             extended_attention_mask = torch.ones(
                 (attention_mask.shape[0], past_length),
                 dtype=attention_mask.dtype,
                 device=attention_mask.device,
             )
 
-            # Filter out only the tokens that can be un-attended, this can happen
-            # if one uses Llava + Fused modules where the cache on the
-            # first iteration is already big enough, or if one passes custom cache
-            valid_indices = non_attended_tokens < extended_attention_mask.size(-1)
-            new_batch_index = batch_index[valid_indices]
-            new_non_attended_tokens = non_attended_tokens[valid_indices]
-
-            # Zero-out the places where we don't need to attend
-            extended_attention_mask[new_batch_index, new_non_attended_tokens] = 0
-
             attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
+
             position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
             inputs["attention_mask"] = attention_mask
             inputs["position_ids"] = position_ids
-
         else:
             inputs = self.prepare_multimodal_input(input_ids, pixel_values, attention_mask, position_ids, image_sizes)
-
+        
         # Run inference
+        start = time.perf_counter()
         self.request.start_async(inputs, share_inputs=True)
         self.request.wait()
+        end = time.perf_counter()
+
+        generation_time = (end - start) * 1000
+        tm_infer_list.append(generation_time)
 
         logits = torch.from_numpy(self.request.get_tensor(self.output_names[0]).data)
 
@@ -358,7 +349,11 @@ class OVMiniCPMForCausalLM(GenerationMixin):
 
     def prepare_multimodal_input(self, input_ids, pixel_values, attention_mask, position_ids, image_sizes=None):
         """Preprocessing function for embedding multimodal data"""
+        tm_infer_list.clear()
+        vision_infer_list.clear()
         inputs = {}
+
+        start = time.perf_counter()
 
         batch_size = input_ids.shape[0]
         if not self.stateful:
@@ -382,7 +377,7 @@ class OVMiniCPMForCausalLM(GenerationMixin):
             inputs["beam_idx"] = self.next_beam_idx if self.next_beam_idx is not None else np.arange(batch_size, dtype=int)
         
         image_start_tokens = torch.where(input_ids == tokenizer.im_start_id)[1]
-        # 跳过 im_start
+        # skip im_start
         image_start_tokens += 1
         image_end_tokens = torch.where(input_ids == tokenizer.im_end_id)[1]
         valid_image_nums = max(len(image_start_tokens), len(image_end_tokens))
@@ -410,6 +405,11 @@ class OVMiniCPMForCausalLM(GenerationMixin):
         inputs["attention_mask"] = attention_mask
         inputs["position_ids"] = position_ids
 
+        end = time.perf_counter()
+
+        prepareinput_time = (end - start) * 1000
+        tm_infer_list.append(prepareinput_time)
+
         return inputs
 
     def get_vision_embedding(self, pixel_values):
@@ -418,27 +418,25 @@ class OVMiniCPMForCausalLM(GenerationMixin):
         dtype = torch.float32
         for pixel_value in pixel_values:
             H, W = pixel_value.shape[-2:]
-            #print("ov Pixel value H w shape ", H, W, pixel_value.shape)
             tgt_size = torch.tensor([[math.ceil(H / self.config.patch_size)], [math.ceil(W / self.config.patch_size)]])
-
-            #print("ov tgt_size prefix_tokens ", tgt_size, self.config.num_prefix_tokens)
+            start = time.perf_counter()
             vision_embedding = self.vision(pixel_value.unsqueeze(0).type(dtype))
-
-            #print("ov vision_embedding ", vision_embedding)
-
+            end = time.perf_counter()
+            vision_infer_list.append(((end - start) * 1000))
             image_features = torch.from_numpy(vision_embedding[0])
-
-            #print("ov vision_embedding tensor ", image_features.shape)
             
             inputs ={}
             inputs["x"] = image_features
             inputs["tgt_size"] = tgt_size
-
+            
+            start = time.perf_counter()
             resampler_feat = self.resampler(inputs)
+            end = time.perf_counter()
+            vision_infer_list.append(((end - start) * 1000))
+
             resampler_feat = torch.from_numpy(resampler_feat[0])
 
-            res.append(resampler_feat) #image_features, tgt_size))
-            #print("ov resampler vision embedding shape ", res[index])
+            res.append(resampler_feat)
             index = index + 1
         return torch.vstack(res)
     
@@ -447,7 +445,6 @@ class OVMiniCPMForCausalLM(GenerationMixin):
             pixel_values_list = data["pixel_values"]
             vision_hidden_states = []
             for pixel_values in pixel_values_list:
-                #print("ov get_vllm_embedding pixel values len ", len(pixel_values))
                 if len(pixel_values) > 0:
                     vision_hidden_states.append(self.get_vision_embedding(pixel_values))
                 else:
@@ -674,7 +671,12 @@ if __name__ == '__main__':
     image = Image.open(args.picture).convert('RGB')
     question = args.prompt #'描述画面内容' #'What is in the image?'
     msgs = [{'role': 'user', 'content': question}]
-    
+        
+    #image resize
+    image_width=1920
+    image_height=1440
+    image = image.resize((image_width, image_height), Image.Resampling.BILINEAR)
+
     #vision info
     config.patch_size= 14
     config.num_prefix_tokens = 0
@@ -682,16 +684,34 @@ if __name__ == '__main__':
     VISION_MODEL_OV = Path(f"{model_path}/minicpm-v-2_vision.xml")
     RESAMPLER_MODEL_OV = Path(f"{model_path}/minicpm-v-2_resampler.xml")
     EBEDDING_MODEL_OV = Path(f"{model_path}/minicpm-v-2_embedding.xml")
-    LANGUAGE_MODEL_OV = Path(f"{model_path}/minicpm-v-2_openvino.xml")
+    LANGUAGE_MODEL_OV = Path(f"{model_path}/minicpm-v-2_openvino-int4.xml")
     
+    tm_infer_list = []
+    vision_infer_list = []
+
     # create OpenVINO Core object instance
     core = ov.Core()
-    ov_minicpmv_model = OVMiniCPMForCausalLM(core, VISION_MODEL_OV, RESAMPLER_MODEL_OV, EBEDDING_MODEL_OV, LANGUAGE_MODEL_OV, device, tokenizer=tokenizer)
+
+    version = get_version()
+    print("OpenVINO version \n", version)
+
+    #set cache
+    core.set_property({'CACHE_DIR': "minicpmv2_cache"})
+
+    ov_minicpmv_model = OVMiniCPMForCausalLM(core, VISION_MODEL_OV, RESAMPLER_MODEL_OV, EBEDDING_MODEL_OV, LANGUAGE_MODEL_OV, device, tokenizer=tokenizer, tm_infer_list=tm_infer_list, vision_infer_list=vision_infer_list)
 
     preprocessor = preprocessor(config=config, tokenizer=tokenizer)
     inputs = preprocessor.get_inputs(image=image, msgs=msgs)
-
+    
     streamer = TextStreamer(tokenizer, skip_special_tokens=True, skip_prompt=True)
 
     output = ov_minicpmv_model.generate(**inputs, max_new_tokens=2048, streamer=streamer)
 
+    if len(tm_infer_list) > 2:
+        avg_token = sum(tm_infer_list[2:]) / (len(tm_infer_list) - 2)
+        print(f"warm up Inputs len {inputs['input_ids'].shape[1]} Vision latency: {tm_infer_list[0]:.2f} ms, First token latency: {tm_infer_list[1]:.2f} ms, Output len {len(tm_infer_list) - 1}, Avage token latency: {avg_token:.2f} ms")
+    
+    if len(vision_infer_list) > 2:
+        sum_vision = sum(vision_infer_list[::2])
+        sum_sampler = sum(vision_infer_list[1: (len(vision_infer_list) -1) : 2])
+        print(f"vision latency : {sum_vision:.2f} ms, sampler latency : {sum_sampler:.2f} ms")
