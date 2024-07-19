@@ -673,8 +673,8 @@ if __name__ == '__main__':
     msgs = [{'role': 'user', 'content': question}]
         
     #image resize
-    image_width=1920
-    image_height=1440
+    image_width=800
+    image_height=800
     image = image.resize((image_width, image_height), Image.Resampling.BILINEAR)
 
     #vision info
