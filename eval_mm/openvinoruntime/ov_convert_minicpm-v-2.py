@@ -221,6 +221,7 @@ if __name__ == '__main__':
     DE_TOKENIZER_MODEL_OV = Path(f"{model_path}/minicpm-v-2_openvino_detokenizer.xml")
     EMBEDDING_MODEL_OV = Path(f"{model_path}/minicpm-v-2_embedding.xml")
     LLM_MODEL_OV = Path(f"{model_path}/minicpm-v-2_openvino.xml")
+    LLM_MODEL_OV_INT4 = Path(f"{model_path}/minicpm-v-2_openvino-int4.xml")
 
     # convert vision model to openvino IR
     if not VISION_MODEL_OV.exists():
@@ -235,8 +236,8 @@ if __name__ == '__main__':
     if not RESAMPLER_MODEL_OV.exists():
        resampler_model = model.resampler
        resampler_model.eval()
-       vision_embedding = torch.randn(1, 1036, 1152, dtype=torch.float32)
-       tgt_size = torch.tensor([[28], [37]])
+       vision_embedding = torch.randn(1, 1024, 1152, dtype=torch.float32)
+       tgt_size = torch.tensor([[32], [32]])
        inputs = (vision_embedding, tgt_size)
        ov_resampler = ov.convert_model(resampler_model, example_input=inputs)
        ov.save_model(ov_resampler, str(RESAMPLER_MODEL_OV), compress_to_fp16=True)  
@@ -287,3 +288,15 @@ if __name__ == '__main__':
         ov.save_model(ov_model, LLM_MODEL_OV)
         save_tokenizer(tokenizer, model_path)
         model.config.save_pretrained(model_path)
+    
+    if not LLM_MODEL_OV_INT4.exists() and LLM_MODEL_OV.exists():
+        compression_configuration = {
+            "mode": nncf.CompressWeightsMode.INT4_SYM,
+            "group_size": 128,
+            "ratio": 1,
+            }
+        core = ov.Core()
+        print("LLM model_ov", LLM_MODEL_OV)
+        ov_model = core.read_model(LLM_MODEL_OV)
+        ov_compressed_model = nncf.compress_weights(ov_model, **compression_configuration)
+        ov.save_model(ov_compressed_model, LLM_MODEL_OV_INT4)
