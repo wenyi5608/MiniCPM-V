@@ -5,6 +5,7 @@
 conda create -n ov_minicpmv2 python=3.10
 conda activate ov_minicpmv2
 pip install -r requirements.txt
+pip install --pre -U openvino openvino-tokenizers --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly
 ```
 
 * Step2. Convert minicpmv2 model to OpenVINO™ IR(Intermediate Representation).
