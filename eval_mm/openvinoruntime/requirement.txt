@@ -3,7 +3,7 @@ numpy
 #auto-gptq>=0.5.1 # for gptq
 pillow
 torch
-transformers>=4.40.0
+transformers==4.41.0
 diffusers>=0.22.0
 #optimum is in dependency list of optimum-intel 
 nncf
