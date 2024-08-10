@@ -11,6 +11,7 @@ import logging as log
 from openvino.runtime import opset13
 import numpy as np
 from typing import  List
+import nncf
 
 
 def save_tokenizer(tokenizer, out_dir):
