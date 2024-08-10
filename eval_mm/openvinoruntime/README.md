@@ -15,6 +15,6 @@ python ov_convert_minicpm-v-2.py -m /path/to/minicpmv2 -o /path/to/minicpmv2_ov
 
 * Step3. Testing
 ``` sh
-python ov_minicpm-v2-test.py -m /path/to/minicpmv2_ov -pic /path/to/airplane.jpeg -p 描述画面内容
+python ov_minicpm-v2-test.py -m /path/to/minicpmv2_ov -pic /path/to/airplane.jpeg -p "Describe the content of the image"
 ```
 
