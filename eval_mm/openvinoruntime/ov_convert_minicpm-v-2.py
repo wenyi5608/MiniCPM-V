@@ -245,7 +245,7 @@ if __name__ == '__main__':
     
     
     if not TOKENIZER_MODEL_OV.exists():
-        ov_tokenizer, ov_detokenizer = convert_tokenizer(tokenizer, with_detokenizer=True)
+        ov_tokenizer, ov_detokenizer = convert_tokenizer(tokenizer, with_detokenizer=True, handle_special_tokens_with_re=True)
         ov.save_model(ov_tokenizer, str(TOKENIZER_MODEL_OV))
         ov.save_model(ov_detokenizer, str(DE_TOKENIZER_MODEL_OV))
     
