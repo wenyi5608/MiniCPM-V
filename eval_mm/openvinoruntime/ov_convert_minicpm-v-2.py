@@ -358,5 +358,3 @@ if __name__ == '__main__':
         manager.register_pass(InsertSlice())
         manager.run_passes(ov_model)
         ov.save_model(ov_model, LLM_MODEL_OV_INT4_REDUCE_LOGITS)
-    
-        ov.save_model(ov_compressed_model, LLM_MODEL_OV_INT4)
