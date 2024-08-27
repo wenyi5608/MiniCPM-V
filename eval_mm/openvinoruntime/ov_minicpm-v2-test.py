@@ -222,6 +222,56 @@ def pad(orig_items, key, max_length=None, padding_value=0, padding_side="left"):
 
     return tensor
 
+def get_2d_sincos_pos_embed(embed_dim, image_size):
+    """
+    image_size: image_size or (image_height, image_width)
+    return:
+    pos_embed: [image_height, image_width, embed_dim]
+    """
+    if isinstance(image_size, int):
+        grid_h_size, grid_w_size = image_size, image_size
+    else:
+        grid_h_size, grid_w_size = image_size[0], image_size[1]
+
+    grid_h = np.arange(grid_h_size, dtype=np.float32)
+    grid_w = np.arange(grid_w_size, dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
+    grid = np.stack(grid, axis=0)
+
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+    return pos_embed
+
+
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+    assert embed_dim % 2 == 0
+
+    # use half of dimensions to encode grid_h
+    emb_h = get_1d_sincos_pos_embed_from_grid_new(embed_dim // 2, grid[0])  # (H, W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid_new(embed_dim // 2, grid[1])  # (H, W, D/2)
+
+    emb = np.concatenate([emb_h, emb_w], axis=-1)  # (H, W, D)
+    return emb
+
+
+def get_1d_sincos_pos_embed_from_grid_new(embed_dim, pos):
+    """
+    embed_dim: output dimension for each position
+    pos: a list of positions to be encoded: size (H, W)
+    out: (H, W, D)
+    """
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float32)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / 10000**omega  # (D/2,)
+
+    out = np.einsum("hw,d->hwd", pos, omega)  # (H, W, D/2), outer product
+
+    emb_sin = np.sin(out)  # (H, W, D/2)
+    emb_cos = np.cos(out)  # (H, W, D/2)
+
+    emb = np.concatenate([emb_sin, emb_cos], axis=-1)  # (H, W, D)
+    return emb
+
 class OVMiniCPMForCausalLM(GenerationMixin):
     def __init__(
         self,
@@ -236,7 +286,7 @@ class OVMiniCPMForCausalLM(GenerationMixin):
         vision_infer_list,
     ):
         self.vision = core.compile_model(core.read_model(vision_path), "CPU") #device)
-        self.resampler = core.compile_model(core.read_model(resampler_path), device)
+        self._resampler = core.compile_model(core.read_model(resampler_path), device)
         self.input_embeddings = core.compile_model(core.read_model(input_embedding_path), device)
         self.model = core.read_model(language_model_path)
         self.input_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.inputs)}
@@ -257,6 +307,9 @@ class OVMiniCPMForCausalLM(GenerationMixin):
         self.tokenizer = tokenizer
         self.tm_infer_list = tm_infer_list
         self.vision_infer_list = vision_infer_list
+        self.embed_dim = self.config.hidden_size
+        self._pos_embeds = torch.from_numpy(get_2d_sincos_pos_embed(self.embed_dim, 70)).float()
+        self.max_size = (70, 70)
 
     def can_generate(self):
         """Returns True to validate the check that the model using `GenerationMixin.generate()` can indeed generate."""
@@ -412,29 +465,55 @@ class OVMiniCPMForCausalLM(GenerationMixin):
 
         return inputs
 
+    def resampler(self, x, tgt_sizes):
+        bs = x.shape[0]
+
+        patch_len = tgt_sizes[:, 0] * tgt_sizes[:, 1]
+
+        self._adjust_pos_cache(tgt_sizes)
+
+        max_patch_len = torch.max(patch_len)
+        key_padding_mask = torch.zeros((bs, max_patch_len), dtype=torch.bool)
+
+        pos_embed = []
+        for i in range(bs):
+            tgt_h, tgt_w = tgt_sizes[i]
+            pos_embed.append(self._pos_embeds[:tgt_h, :tgt_w, :].reshape((tgt_h * tgt_w, -1)))  # patches * D
+            key_padding_mask[i, patch_len[i] :] = True
+
+        pos_embed = torch.nn.utils.rnn.pad_sequence(pos_embed, batch_first=True, padding_value=0.0).permute(1, 0, 2)  # BLD => L * B * D
+
+        res = torch.from_numpy(self._resampler([x, pos_embed, key_padding_mask])[0])
+        return res
+
+    def _set_2d_pos_cache(self, max_size):
+        pos_embed = torch.from_numpy(get_2d_sincos_pos_embed(self.embed_dim, max_size)).float()
+        self._pos_embed = pos_embed
+
+    def _adjust_pos_cache(self, tgt_sizes):
+        max_h = torch.max(tgt_sizes[:, 0])
+        max_w = torch.max(tgt_sizes[:, 1])
+        if max_h > self.max_size[0] or max_w > self.max_size[1]:
+            self.max_size = [max(max_h, self.max_size[0]), max(max_w, self.max_size[1])]
+            self._set_2d_pos_cache(self.max_sizes)
+
     def get_vision_embedding(self, pixel_values):
         res = []
         index = 0
         dtype = torch.float32
         for pixel_value in pixel_values:
             H, W = pixel_value.shape[-2:]
-            tgt_size = torch.tensor([[math.ceil(H / self.config.patch_size)], [math.ceil(W / self.config.patch_size)]])
+            tgt_size = torch.tensor([[math.ceil(H / self.config.patch_size), math.ceil(W / self.config.patch_size)]])
             start = time.perf_counter()
             vision_embedding = self.vision(pixel_value.unsqueeze(0).type(dtype))
             end = time.perf_counter()
             vision_infer_list.append(((end - start) * 1000))
             image_features = torch.from_numpy(vision_embedding[0])
             
-            inputs ={}
-            inputs["x"] = image_features
-            inputs["tgt_size"] = tgt_size
-            
             start = time.perf_counter()
-            resampler_feat = self.resampler(inputs)
+            resampler_feat = self.resampler(image_features, tgt_size)
             end = time.perf_counter()
             vision_infer_list.append(((end - start) * 1000))
-
-            resampler_feat = torch.from_numpy(resampler_feat[0])
 
             res.append(resampler_feat)
             index = index + 1
@@ -672,11 +751,6 @@ if __name__ == '__main__':
     question = args.prompt #'描述画面内容' #'What is in the image?'
     msgs = [{'role': 'user', 'content': question}]
         
-    #image resize
-    image_width=800
-    image_height=800
-    image = image.resize((image_width, image_height), Image.Resampling.BILINEAR)
-
     #vision info
     config.patch_size= 14
     config.num_prefix_tokens = 0
